@@ -1,687 +1,664 @@
-/*
-  REAL Speeduino -> Nextion dashboard firmware.
-  ------------------------------------------------------------------------
-  This replaces the sweep/test loop from esp32_rpm_full_test.ino with real
-  data pulled from a Speeduino ECU over Bluetooth Classic (SPP), using the
-  same Nextion object names, colors, thresholds and "only send when
-  changed" apply*() functions built and tested in that file.
-
-  CONNECTIONS:
-    Nextion  <- UART2 (GPIO4 RX2 / GPIO5 TX2), NOT Serial/USB anymore.
-                nextionBaud must match Page0's Preinitialize Event
-                "bauds=" setting.
-                  ESP32 RX2 (4) <- Nextion TX
-                  ESP32 TX2 (5) -> Nextion RX
-                (moved off GPIO16/17: those are only free as GPIO on the
-                plain WROOM module - on a WROVER-variant board they're
-                permanently wired to PSRAM and can't act as a UART at
-                all, which is the likely reason 16/17 gave no reply)
-    Speeduino <- Bluetooth Classic SPP, via a Bluetooth-serial module
-                (e.g. HC-05/06) wired to Speeduino's TX/RX pins. The ESP32
-                connects to that module as the Bluetooth MASTER - no extra
-                GPIO wiring needed on the ESP32 side, this all happens over
-                the radio.
-
-  SPEEDUINO_BT_MAC below is set to 78:D8:5D:10:22:77 - the address you
-  found with esp32_bt_scan.ino. If you ever swap the Bluetooth module,
-  re-run that scan sketch and update the address here.
-
-  SPEEDUINO PROTOCOL: sending the single ASCII byte 'A' makes Speeduino
-  reply with a raw binary block of live data, no header/length/CRC, byte 0
-  starting immediately. Offsets below are confirmed against Speeduino's
-  own reference/speeduino.ini + logger.cpp source for the current stable
-  release (202501.7) and current dev branch - offsets 0-124 are identical
-  between them, so this should hold for any reasonably recent firmware.
-  If your firmware is old (pre ~2020) or you see obviously wrong values,
-  check reference/speeduino.ini in YOUR firmware's exact source tree
-  against these offsets - Speeduino only ever appends new fields at the
-  end, it doesn't move existing ones, but very old versions may predate
-  some of these.
-
-    offset  size  field           notes
-    ------  ----  --------------  -----------------------------------------
-    4       U16   MAP             kPa (not currently used/displayed)
-    6       U08   IAT (raw)       actual C = raw - 40
-    7       U08   coolant (raw)   actual C = raw - 40
-    9       U08   battery volts   raw already = volts*10 (e.g. 125 = 12.5V)
-    10      U08   AFR             raw already = AFR*10 (e.g. 147 = 14.7)
-    14      U16   RPM             little-endian, straight rpm value
-    24      S08   advance         ignition timing, degrees BTDC directly
-                                   (signed - negative = retarded past TDC,
-                                   no offset math needed, unlike IAT/CLT)
-    25      U08   TPS (raw)       actual % = raw * 0.5
-    104     U16   VSS (speed)     km/h, little-endian
-    106     U08   gear            raw gear number; 0 if no gear input wired
-
-  CHANNELS -> NEXTION:
-    RPM       -> j2 (bar) / n0 (number, pco+borderc) / t0 (label, pco)
-                 + bt0-bt6 shift lights + flashing redline above 7500rpm
-    Coolant   -> j0 (bar) / n2 (number, pco+borderc) / t4 (label, pco)
-    AFR       -> j1 (bar) / t12 (decimal text, pco) / t5 (label, pco)
-    TPS       -> j3 (bar) / n4 (number) - value only, no color
-    IAT       -> j4 (bar) / n5 (number, pco+borderc) / t7 (label, pco)
-    Battery   -> j5 (bar) / t13 (decimal text, pco) / t8 (label, pco)
-    Speed     -> n1 (number) - value only, no color, raw km/h
-    Gear      -> t2 (text) - value only, no color, raw gear number as string
-    Ignition  -> j6 (bar) / n7 (number) - value only, no color, -20 to 45 deg
-                 (t9 label not touched, same as TPS's t6)
-    Fuel      -> j8 (bar) / n9 (number, pco+borderc) / t11 (label, pco)
-                 red under 20%, green rest - NOT from Speeduino, read from
-                 a resistive sender (300ohm empty/35ohm full) through its
-                 own voltage divider into GPIO34. See the "Fuel sender"
-                 section further down for the wiring and math.
-
-  All color zones/thresholds are identical to esp32_rpm_full_test.ino - if
-  you tune one, tune it there too (or just keep this file as the only
-  copy going forward, your call).
-*/
-
-#include "BluetoothSerial.h"
-
-#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
-#error Bluetooth Classic is not enabled for this build - in Arduino IDE, Tools > Partition Scheme, pick one with enough app space (e.g. "Default" or "Huge APP"), and make sure you're targeting a classic ESP32 board (not S3/C3, which don't support Bluetooth Classic/SPP).
-#endif
-
-HardwareSerial NextionSerial(2); // UART2, remapped below to GPIO4(RX2)/5(TX2)
-const int NEXTION_RX_PIN = 4; // ESP32 RX2 <- Nextion TX
-const int NEXTION_TX_PIN = 5; // ESP32 TX2 -> Nextion RX
-
-BluetoothSerial SerialSpeeduino;
-
-// Bluetooth-serial module's MAC address (78:D8:5D:10:22:77)
-uint8_t SPEEDUINO_BT_MAC[6] = { 0x78, 0xD8, 0x5D, 0x10, 0x22, 0x77 };
-
-const uint32_t nextionBaud = 115200; // must match Page0's Preinitialize Event "bauds="
-
-const char* BAR_OBJNAME  = "j2";
-const char* NUM_OBJNAME  = "n0";
-const char* TEXT_OBJNAME = "t0";
-
-const char* TEMP_BAR_OBJNAME  = "j0";
-const char* TEMP_NUM_OBJNAME  = "n2";
-const char* TEMP_TEXT_OBJNAME = "t4";
-
-const char* AFR_BAR_OBJNAME   = "j1";
-const char* AFR_TEXT_OBJNAME  = "t12";
-const char* AFR_LABEL_OBJNAME = "t5";
-
-const char* TPS_BAR_OBJNAME = "j3";
-const char* TPS_NUM_OBJNAME = "n4";
-
-const char* IAT_BAR_OBJNAME  = "j4";
-const char* IAT_NUM_OBJNAME  = "n5";
-const char* IAT_TEXT_OBJNAME = "t7";
-
-const char* BATTERY_BAR_OBJNAME   = "j5";
-const char* BATTERY_TEXT_OBJNAME  = "t13";
-const char* BATTERY_LABEL_OBJNAME = "t8";
-
-const char* SPEED_OBJNAME = "n1"; // value only, no color, raw km/h
-const char* GEAR_OBJNAME  = "t2"; // value only, no color, raw gear number as text
-
-// Ignition advance: value only, no color, per your instruction - t9 (label)
-// isn't touched at all, same as TPS's t6.
-const char* IGN_BAR_OBJNAME = "j6";
-const char* IGN_NUM_OBJNAME = "n7";
-
-// Fuel level: same full color pattern as coolant/IAT (bar+number+label).
-// NOT from Speeduino - read directly from a resistive sender via its own
-// ADC pin, see the "Fuel sender" section below.
-const char* FUEL_BAR_OBJNAME   = "j8";
-const char* FUEL_NUM_OBJNAME   = "n9";
-const char* FUEL_LABEL_OBJNAME = "t11";
-
-const int TACH_MAX_RPM = 8000;
-const int COOLANT_MAX_C = 120;
-const int IAT_MAX_C = 100;
-
-const int AFR_MIN_X10 = 100; // 10.0
-const int AFR_MAX_X10 = 200; // 20.0
-
-const int BATTERY_MIN_X10 = 80;  // 8.0V
-const int BATTERY_MAX_X10 = 160; // 16.0V
-
-const int IGN_MIN_DEG = -20; // degrees BTDC (negative = retarded past TDC)
-const int IGN_MAX_DEG = 45;
-
-// --- fuel color zone threshold ---
-const int FUEL_RED_MAX_PCT = 20; // < this -> red, else green
-
-// --- your exact color values (decimal, as shown in the Nextion Editor) ---
-const long COLOR_BLACK  = 6404;
-const long COLOR_RED    = 64197;
-const long COLOR_BLUE   = 15964;
-const long COLOR_GREEN  = 20113;
-const long COLOR_YELLOW = 65504;
-const long COLOR_WHITE  = 65535;
-
-// --- RPM color zone thresholds ---
-const int RPM_YELLOW = 6000;
-const int RPM_RED    = 6500;
-
-long colorForRpm(long rpm) {
-  if (rpm >= RPM_RED)    return COLOR_RED;
-  if (rpm >= RPM_YELLOW) return COLOR_YELLOW;
-  return COLOR_GREEN;
-}
-
-// --- coolant color zone thresholds ---
-const int COOLANT_GREEN_START = 50;
-const int COOLANT_RED_START   = 95;
-
-long colorForCoolant(long tempC) {
-  if (tempC >= COOLANT_RED_START)   return COLOR_RED;
-  if (tempC >= COOLANT_GREEN_START) return COLOR_GREEN;
-  return COLOR_BLUE;
-}
-
-// --- AFR color zones (compared in tenths) ---
-const int AFR_GREEN_START_X10 = 130; // >= 13.0 -> green
-const int AFR_RED_START_X10   = 160; // >= 16.0 -> red
-
-long colorForAfr(long valueX10) {
-  if (valueX10 >= AFR_RED_START_X10)   return COLOR_RED;
-  if (valueX10 >= AFR_GREEN_START_X10) return COLOR_GREEN;
-  return COLOR_YELLOW;
-}
-
-// --- IAT color zones ---
-const int IAT_GREEN_START = 20;
-const int IAT_RED_START   = 60;
-
-long colorForIat(long tempC) {
-  if (tempC >= IAT_RED_START)   return COLOR_RED;
-  if (tempC >= IAT_GREEN_START) return COLOR_GREEN;
-  return COLOR_BLUE;
-}
-
-// --- battery color zones (compared in tenths); red-green-red ---
-const int BATTERY_RED_LOW_MAX_X10  = 130; // < 13.0 -> red (undercharging)
-const int BATTERY_RED_HIGH_MIN_X10 = 150; // >= 15.0 -> red (overvoltage)
-
-long colorForBattery(long voltX10) {
-  if (voltX10 < BATTERY_RED_LOW_MAX_X10)  return COLOR_RED;
-  if (voltX10 < BATTERY_RED_HIGH_MIN_X10) return COLOR_GREEN;
-  return COLOR_RED;
-}
-
-long colorForFuel(long pct) {
-  if (pct < FUEL_RED_MAX_PCT) return COLOR_RED;
-  return COLOR_GREEN;
-}
-
-// --- flashing redline warning ---
-const int FLASH_RPM = 7500;
-const uint32_t FLASH_INTERVAL_MS = 500;
-
-// --- shift-light buttons: name + threshold, cumulative on/off ---
-struct ShiftLight {
-  const char* name;
-  int threshold;
-  int lastState; // -1 = never sent yet
-};
-
-ShiftLight lights[] = {
-  {"bt0", 5000, -1},
-  {"bt1", 5333, -1},
-  {"bt2", 5667, -1},
-  {"bt3", 6000, -1},
-  {"bt4", 6250, -1},
-  {"bt5", 6500, -1},
-  {"bt6", 6750, -1},
-};
-const int NUM_LIGHTS = sizeof(lights) / sizeof(lights[0]);
-
-// --- last-sent state, so we only write to Nextion when something changes ---
-int lastSentPct = -1;
-int lastSentRpm = -1;
-long lastSentColor = -1;
-
-int lastSentCoolantPct = -1;
-int lastSentCoolantC = -1;
-long lastSentCoolantColor = -1;
-
-int lastSentAfrPct = -1;
-int lastSentAfrValX10 = -1;
-long lastSentAfrColor = -1;
-
-int lastSentTpsPct = -1;
-int lastSentTpsVal = -1;
-
-int lastSentIatPct = -1;
-int lastSentIatC = -1;
-long lastSentIatColor = -1;
-
-int lastSentBatteryPct = -1;
-int lastSentBatteryValX10 = -1;
-long lastSentBatteryColor = -1;
-
-long lastSentSpeed = -1;
-long lastSentGear = -1;
-
-int lastSentIgnPct = -1;
-long lastSentIgnVal = -1000; // outside the valid -20..45 range - never collides with a real reading
-
-int lastSentFuelPct = -1;
-long lastSentFuelColor = -1;
-
-void nextionEnd() {
-  NextionSerial.write(0xFF);
-  NextionSerial.write(0xFF);
-  NextionSerial.write(0xFF);
-}
-
-void nextionSetVal(const char* component, long value) {
-  NextionSerial.printf("%s.val=%ld", component, value);
-  nextionEnd();
-}
-
-void nextionSetPco(const char* component, long color) {
-  NextionSerial.printf("%s.pco=%ld", component, color);
-  nextionEnd();
-}
-
-void nextionSetBorderc(const char* component, long color) {
-  NextionSerial.printf("%s.borderc=%ld", component, color);
-  nextionEnd();
-  NextionSerial.printf("ref %s", component); // borderc needs an explicit redraw
-  nextionEnd();
-}
-
-void nextionSetText(const char* component, const char* text) {
-  NextionSerial.printf("%s.txt=\"%s\"", component, text);
-  nextionEnd();
-}
-
-int valueToPct(long value, long maxValue) {
-  if (value < 0) value = 0;
-  if (value > maxValue) value = maxValue;
-  int pct = (int)((100 * value + maxValue / 2) / maxValue);
-  if (pct > 100) pct = 100;
-  return pct;
-}
-
-void applyColorZone(long rpm) {
-  long color = colorForRpm(rpm);
-  if (color != lastSentColor) {
-    nextionSetPco(BAR_OBJNAME, color);
-    nextionSetPco(NUM_OBJNAME, color);
-    nextionSetBorderc(NUM_OBJNAME, color);
-    nextionSetPco(TEXT_OBJNAME, color);
-    lastSentColor = color;
-  }
-}
-
-void applyShiftLights(long rpm) {
-  bool flashing = (rpm >= FLASH_RPM);
-  bool flashOn = ((millis() / FLASH_INTERVAL_MS) % 2) == 0;
-
-  for (int i = 0; i < NUM_LIGHTS; i++) {
-    int state;
-    if (flashing) {
-      state = flashOn ? 1 : 0;
-    } else {
-      state = (rpm >= lights[i].threshold) ? 1 : 0;
-    }
-    if (state != lights[i].lastState) {
-      nextionSetVal(lights[i].name, state);
-      lights[i].lastState = state;
-    }
-  }
-}
-
-void applyRpm(long rpm) {
-  int pct = valueToPct(rpm, TACH_MAX_RPM);
-  if (pct != lastSentPct) {
-    nextionSetVal(BAR_OBJNAME, pct);
-    lastSentPct = pct;
-  }
-  if (rpm != lastSentRpm) {
-    nextionSetVal(NUM_OBJNAME, rpm);
-    lastSentRpm = rpm;
-  }
-  applyColorZone(rpm);
-  applyShiftLights(rpm);
-}
-
-void applyCoolant(long tempC) {
-  int pct = valueToPct(tempC, COOLANT_MAX_C);
-  if (pct != lastSentCoolantPct) {
-    nextionSetVal(TEMP_BAR_OBJNAME, pct);
-    lastSentCoolantPct = pct;
-  }
-  if (tempC != lastSentCoolantC) {
-    nextionSetVal(TEMP_NUM_OBJNAME, tempC);
-    lastSentCoolantC = tempC;
-  }
-
-  long color = colorForCoolant(tempC);
-  if (color != lastSentCoolantColor) {
-    nextionSetPco(TEMP_BAR_OBJNAME, color);
-    nextionSetPco(TEMP_NUM_OBJNAME, color);
-    nextionSetBorderc(TEMP_NUM_OBJNAME, color);
-    nextionSetPco(TEMP_TEXT_OBJNAME, color);
-    lastSentCoolantColor = color;
-  }
-}
-
-void applyAfr(long valueX10) {
-  int pct = valueToPct(valueX10 - AFR_MIN_X10, AFR_MAX_X10 - AFR_MIN_X10);
-  if (pct != lastSentAfrPct) {
-    nextionSetVal(AFR_BAR_OBJNAME, pct);
-    lastSentAfrPct = pct;
-  }
-  if (valueX10 != lastSentAfrValX10) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%.1f", valueX10 / 10.0);
-    nextionSetText(AFR_TEXT_OBJNAME, buf);
-    lastSentAfrValX10 = valueX10;
-  }
-
-  long color = colorForAfr(valueX10);
-  if (color != lastSentAfrColor) {
-    nextionSetPco(AFR_BAR_OBJNAME, color);
-    nextionSetPco(AFR_TEXT_OBJNAME, color);
-    nextionSetPco(AFR_LABEL_OBJNAME, color);
-    lastSentAfrColor = color;
-  }
-}
-
-void applyIat(long tempC) {
-  int pct = valueToPct(tempC, IAT_MAX_C);
-  if (pct != lastSentIatPct) {
-    nextionSetVal(IAT_BAR_OBJNAME, pct);
-    lastSentIatPct = pct;
-  }
-  if (tempC != lastSentIatC) {
-    nextionSetVal(IAT_NUM_OBJNAME, tempC);
-    lastSentIatC = tempC;
-  }
-
-  long color = colorForIat(tempC);
-  if (color != lastSentIatColor) {
-    nextionSetPco(IAT_BAR_OBJNAME, color);
-    nextionSetPco(IAT_NUM_OBJNAME, color);
-    nextionSetBorderc(IAT_NUM_OBJNAME, color);
-    nextionSetPco(IAT_TEXT_OBJNAME, color);
-    lastSentIatColor = color;
-  }
-}
-
-void applyBattery(long voltX10) {
-  int pct = valueToPct(voltX10 - BATTERY_MIN_X10, BATTERY_MAX_X10 - BATTERY_MIN_X10);
-  if (pct != lastSentBatteryPct) {
-    nextionSetVal(BATTERY_BAR_OBJNAME, pct);
-    lastSentBatteryPct = pct;
-  }
-  if (voltX10 != lastSentBatteryValX10) {
-    char buf[16];
-    snprintf(buf, sizeof(buf), "%.1f", voltX10 / 10.0);
-    nextionSetText(BATTERY_TEXT_OBJNAME, buf);
-    lastSentBatteryValX10 = voltX10;
-  }
-
-  long color = colorForBattery(voltX10);
-  if (color != lastSentBatteryColor) {
-    nextionSetPco(BATTERY_BAR_OBJNAME, color);
-    nextionSetPco(BATTERY_TEXT_OBJNAME, color);
-    nextionSetPco(BATTERY_LABEL_OBJNAME, color);
-    lastSentBatteryColor = color;
-  }
-}
-
-// value-only, no color, per your instruction
-void applyTps(long pct) {
-  if (pct != lastSentTpsPct) {
-    nextionSetVal(TPS_BAR_OBJNAME, pct);
-    lastSentTpsPct = pct;
-  }
-  if (pct != lastSentTpsVal) {
-    nextionSetVal(TPS_NUM_OBJNAME, pct);
-    lastSentTpsVal = pct;
-  }
-}
-
-// value-only, no color - raw km/h straight from Speeduino's VSS output
-void applySpeed(long kph) {
-  if (kph != lastSentSpeed) {
-    nextionSetVal(SPEED_OBJNAME, kph);
-    lastSentSpeed = kph;
-  }
-}
-
-// value-only, no color - raw gear number as text (0 if no gear input wired
-// on Speeduino)
-void applyGear(long gear) {
-  if (gear != lastSentGear) {
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%ld", gear);
-    nextionSetText(GEAR_OBJNAME, buf);
-    lastSentGear = gear;
-  }
-}
-
-// Ignition advance in degrees BTDC, -20..45 - value only, no color, per
-// your instruction. t9 (label) isn't touched at all, same as TPS's t6.
-void applyIgnition(long deg) {
-  int pct = valueToPct(deg - IGN_MIN_DEG, IGN_MAX_DEG - IGN_MIN_DEG);
-  if (pct != lastSentIgnPct) {
-    nextionSetVal(IGN_BAR_OBJNAME, pct);
-    lastSentIgnPct = pct;
-  }
-  if (deg != lastSentIgnVal) {
-    nextionSetVal(IGN_NUM_OBJNAME, deg); // Nextion Number supports negative values fine
-    lastSentIgnVal = deg;
-  }
-}
-
-// Fuel level, already a smoothed 0-100 percentage by the time it gets here
-// (see readFuelPercentSmoothed()) - red under 20%, green otherwise.
-void applyFuel(long pct) {
-  if (pct != lastSentFuelPct) {
-    nextionSetVal(FUEL_BAR_OBJNAME, pct);
-    nextionSetVal(FUEL_NUM_OBJNAME, pct);
-    lastSentFuelPct = pct;
-  }
-
-  long color = colorForFuel(pct);
-  if (color != lastSentFuelColor) {
-    nextionSetPco(FUEL_BAR_OBJNAME, color);
-    nextionSetPco(FUEL_NUM_OBJNAME, color);
-    nextionSetBorderc(FUEL_NUM_OBJNAME, color);
-    nextionSetPco(FUEL_LABEL_OBJNAME, color);
-    lastSentFuelColor = color;
-  }
-}
-
-// ---------------------------------------------------------------------
-// Speeduino link (Bluetooth Classic SPP)
-// ---------------------------------------------------------------------
-
-const uint32_t BT_RECONNECT_INTERVAL_MS = 5000; // how often to retry if not connected
-uint32_t lastBtAttempt = 0;
-
-void connectSpeeduinoIfNeeded() {
-  if (SerialSpeeduino.connected(0)) return;
-  if (millis() - lastBtAttempt < BT_RECONNECT_INTERVAL_MS) return;
-  lastBtAttempt = millis();
-  SerialSpeeduino.connect(SPEEDUINO_BT_MAC); // blocks briefly (up to a few sec) while it tries
-}
-
-// Bluetooth Classic SPP has real, variable latency (tens of ms is normal
-// for an HC-05/06-style module) - polling every 40ms with only a "drain
-// whatever's sitting in the buffer right now" flush was too aggressive:
-// stragglers from the PREVIOUS response could still be in flight over the
-// air, arrive AFTER that one-shot flush, and land mixed in with the START
-// of the next response. That shifts every byte offset by a few bytes on a
-// random subset of polls, so RPM/coolant/etc parse as noisy garbage that's
-// different every single cycle - which is exactly "everything flashing":
-// every apply*() sees a "changed" value 25 times a second and redraws.
+// =====================================================================
+//  AX Race Dash - LIVE  (Speeduino --Bluetooth--> ESP32 --> Nextion NX8048T070)
 //
-// Fix: poll slower, wait longer for the reply, and flush by waiting for
-// the RX buffer to go quiet for a stretch (not just momentarily empty)
-// before sending the next 'A'.
-const uint32_t SPEEDUINO_POLL_INTERVAL_MS = 100; // ~10Hz - plenty smooth for gauges, much safer over BT
-const uint32_t SPEEDUINO_RESPONSE_TIMEOUT_MS = 250; // generous - BT SPP round-trip can be slow
-const uint32_t SPEEDUINO_FLUSH_QUIET_MS = 30; // RX must be empty for this long before we consider it flushed
-const int SPEEDUINO_RESPONSE_MIN_BYTES = 107; // need through offset 106 (gear)
-uint8_t speeduinoBuf[140];
-uint32_t lastPollTime = 0;
+//  Board: original ESP32 / ESP32-WROOM-32 (needs Bluetooth Classic - S3 / C3 will NOT work)
+//  Arduino IDE: Board "ESP32 Dev Module",
+//               Partition Scheme "Huge APP (3MB No OTA)" (or "Minimal SPIFFS" - both fit)
+//  Power: solid 5 V supply + 470-1000uF at the ESP32 - Bluetooth current spikes
+//         caused "gauges reset every second" brown-outs in your earlier build.
+//
+//  Wiring: ESP32 GPIO5 (TX) -> Nextion RX (yellow)
+//          ESP32 GPIO4 (RX) <- Nextion TX (blue)
+//          GND common, Nextion 5V from its own 1 A+ supply
+//
+//  Serial Monitor (115200): type  d  = toggle raw Speeduino packet dump
+//                                  n  = toggle bytes received from the Nextion
+//                                  s  = print decoded values once
+//
+//  Everything you may need to change is in the CONFIG section below.
+// =====================================================================
 
-// Keeps reading and discarding bytes until none have arrived for
-// SPEEDUINO_FLUSH_QUIET_MS straight - a plain "while(available()) read()"
-// can return while stragglers are still travelling over the radio.
-void flushSpeeduinoRx() {
-  uint32_t quietSince = millis();
-  while (millis() - quietSince < SPEEDUINO_FLUSH_QUIET_MS) {
-    if (SerialSpeeduino.available()) {
-      SerialSpeeduino.read();
-      quietSince = millis(); // saw a byte - reset the quiet timer
-    }
+#include <Arduino.h>
+#include <Preferences.h>
+#include <BluetoothSerial.h>
+#include <stdarg.h>
+
+// =====================================================================
+//  CONFIG
+// =====================================================================
+// ---- Nextion ----
+#define NEX Serial2
+const int NEX_RX = 4, NEX_TX = 5;
+const uint32_t NEX_BAUD = 115200;
+
+// ---- Bluetooth link to the HC-05/HC-06 on the Speeduino ----
+const char *ESP_BT_NAME = "AXDash";
+const bool  BT_USE_ADDRESS = true;                         // connect by MAC (your working setup)
+const char *ECU_BT_NAME = "HC-05";                         // only used if BT_USE_ADDRESS = false
+uint8_t     ECU_BT_ADDR[6] = {0x78, 0xD8, 0x5D, 0x10, 0x22, 0x77};  // 78:D8:5D:10:22:77 (from esp32_bt_scan)
+const char *ECU_BT_PIN = "1234";
+
+// ---- Speeduino request: legacy 'A' command (same as your working dash) ----
+// 'A' returns a raw live-data block, byte 0 = first data byte, no header.
+// Offsets checked against speeduino.ini 202501.x (same as your repo).
+const int  POLL_MS         = 100;    // 10 Hz - faster polling over BT caused misaligned frames before
+const int  RESP_TIMEOUT_MS = 250;    // BT SPP round trip can be slow
+const int  FLUSH_QUIET_MS  = 30;     // RX must be silent this long before a new request
+const int  OFS_IAT    = 6;    // U08, degC + 40
+const int  OFS_CLT    = 7;    // U08, degC + 40
+const int  OFS_BATT   = 9;    // U08, volts * 10
+const int  OFS_AFR    = 10;   // U08, AFR * 10
+const int  OFS_RPM    = 14;   // U16 little-endian
+const int  OFS_VSS    = 104;  // U16 km/h        (-1 = not used, shows "--")
+const int  OFS_GEAR   = 106;  // U08, 0 = none   (-1 = not used)
+const int  OFS_OIL    = -1;   // U08 oil pressure: set 108 if you have an oil pressure sensor on Speeduino
+const bool OIL_RAW_IS_PSI = true;                          // Speeduino reports oil pressure in psi
+const int  RESP_MIN   = (OFS_OIL > OFS_GEAR ? OFS_OIL : OFS_GEAR) + 1;   // bytes we need from each reply
+
+// ---- fuel level: resistive sender on GPIO34 (same divider as your repo) ----
+//   3.3V --[150 ohm]--+--[sender 300 ohm empty / 35 ohm full]-- GND,  1uF GPIO34 -> GND
+const int   FUEL_PIN = 34;                                 // -1 = no sender, show "--"
+const float FUEL_DIVIDER_FIXED_OHMS = 150.0f;
+const float FUEL_EMPTY_OHMS = 300.0f, FUEL_FULL_OHMS = 35.0f;
+
+// ---- gear: from Speeduino (needs VSS + gear ratios in TunerStudio) or calculated here ----
+const bool  CALC_GEAR = true;                              // use ratios below if the ECU gives 0
+const float RATIO[7] = {0, 3.36, 2.07, 1.43, 1.13, 0.92, 0.78};
+const float FINAL_DRIVE = 4.10;
+const float TYRE_CIRC_M = 1.90;
+
+// ---- picture IDs - must match the Picture list in the Nextion Editor ----
+const int PIC_RPM_ON = 2;                                  // normal RPM bar image (j0.ppic)
+const int PIC_GEAR_R = 4, PIC_GEAR_N = 5;                  // gear n uses PIC_GEAR_N + n
+const int PIC_TOG_C = 27, PIC_TOG_F = 28, PIC_TOG_BAR = 29, PIC_TOG_PSI = 30;
+const int PIC_TOG_KMH = 31, PIC_TOG_MPH = 32;
+
+// ---- colours (RGB565) ----
+const uint16_t C_WHITE = 61342, C_AMBER = 62855, C_RED = 57929, C_GREEN = 16112;
+
+// ---- timing ----
+const uint32_t TILE_MS       = 200;   // tiles (temps, battery, AFR, fuel) refresh
+const uint32_t STALE_MS      = 600;   // no packet for this long -> show "--"
+const uint32_t PAGE_POLL_MS  = 1000;  // safety net: ask the Nextion which page it shows
+const uint32_t BRI_POLL_MS   = 150;   // safety net: read the brightness slider on page 1
+
+#define DEG "\xB0"                    // degree sign in the Nextion's ISO-8859-1 font
+
+// =====================================================================
+//  Types (all structs ABOVE the first function - Arduino IDE rule)
+// =====================================================================
+struct Settings {
+  uint8_t bright = 80;
+  bool tempF = false, psi = false, mph = false;
+  float barStart = 1000, barFull = 8500, shiftOn = 7600, shiftOff = 7400, flashMs = 80;
+  float waterHot = 105, airHot = 60, oilLow = 1.0, oilCheckRpm = 2000;
+  float battLow = 12.0, battHigh = 15.0, fuelLow = 15, afrLean = 15.0;
+};
+Settings S;
+Preferences prefs;
+bool settingsDirty = false;
+
+enum Kind { K_RPM, K_MS, K_TEMP, K_BAR, K_VOLT, K_PCT, K_AFR };
+struct Param { uint8_t page; const char *obj; float *v; float step, lo, hi; Kind kind; };
+Param PARAMS[] = {
+  // page 2 - shift light   (buttons send codes 0x20..0x29)
+  {2, "tP0", &S.barStart,    100,  0,    6000,  K_RPM},
+  {2, "tP1", &S.barFull,     100,  3000, 12000, K_RPM},
+  {2, "tP2", &S.shiftOn,     50,   2000, 12000, K_RPM},
+  {2, "tP3", &S.shiftOff,    50,   1500, 12000, K_RPM},
+  {2, "tP4", &S.flashMs,     10,   40,   300,   K_MS},
+  // page 3 - warnings      (buttons send codes 0x30..0x3F)
+  {3, "tW0", &S.waterHot,    1,    70,   130,   K_TEMP},
+  {3, "tW1", &S.airHot,      1,    20,   90,    K_TEMP},
+  {3, "tW2", &S.oilLow,      0.1,  0.2,  5.0,   K_BAR},
+  {3, "tW3", &S.oilCheckRpm, 100,  0,    6000,  K_RPM},
+  {3, "tW4", &S.battLow,     0.1,  10.0, 13.5,  K_VOLT},
+  {3, "tW5", &S.battHigh,    0.1,  13.5, 16.5,  K_VOLT},
+  {3, "tW6", &S.fuelLow,     1,    0,    50,    K_PCT},
+  {3, "tW7", &S.afrLean,     0.1,  13.0, 18.0,  K_AFR},
+};
+const int N_PARAMS = sizeof(PARAMS) / sizeof(PARAMS[0]);
+
+struct Tile { const char *t; const char *h; float lo, hi; uint8_t dec; };
+const Tile TILES[6] = {
+  {"tOil", "hOil",  0,   7, 1},   // bar  (bands are always metric)
+  {"tWat", "hWat", 40, 120, 0},   // degC
+  {"tBat", "hBat", 10,  16, 1},   // V
+  {"tAfr", "hAfr", 10,  18, 1},   // AFR
+  {"tFue", "hFue",  0, 100, 0},   // %
+  {"tAir", "hAir",  0,  80, 0},   // degC
+};
+enum { OIL, WAT, BAT, AFR, FUE, AIR };
+
+// Last command sent to each dash field = what the dash SHOULD show.
+// Fixed-size char buffers instead of String: no heap churn on every update.
+struct Cache { char cmd[40]; };
+Cache cRpm, cRpmCol, cBar, cGear, cSpd, cVal[6], cPos[6], cCol[6], cUOil, cUWat, cUAir, cUSpd;
+
+struct Peaks { float rpm = 0, kmh = 0, water = 0, oil = 99; };
+Peaks PK;
+
+// live data from the ECU task (core 0) to the display loop (core 1)
+struct EcuData {
+  float rpm = 0, kmh = 0, clt = 0, iat = 0, batt = 0, afr = 0, oilBar = 0;
+  int gear = 0;
+  uint32_t stamp = 0;            // millis() of the last good packet
+};
+EcuData ECU;
+portMUX_TYPE ecuMux = portMUX_INITIALIZER_UNLOCKED;
+enum LinkState { LINK_SEARCHING, LINK_CONNECTED };
+volatile LinkState linkState = LINK_SEARCHING;
+volatile uint16_t pktPerSec = 0;
+volatile uint32_t pktErrors = 0;
+volatile bool dumpRaw = false;
+bool dumpNex = false;
+
+BluetoothSerial SerialBT;
+
+bool trackPeaks = false;
+float curRpm = 0;
+float lastTile[6], lastKmh = -1;
+bool lastWarn[6], tileValid[6];
+bool showingNoData = false;
+
+int curPage = 0;
+bool shiftOn = false;
+int heldCode = -1;
+uint32_t heldSince = 0, lastRepeat = 0, lastStatus = 0, pageFilledAt = 0;
+
+// =====================================================================
+//  Nextion output
+// =====================================================================
+void nexCmd(const char *c) {
+  static const uint8_t END[3] = {0xFF, 0xFF, 0xFF};
+  NEX.write((const uint8_t *)c, strlen(c));
+  NEX.write(END, 3);
+}
+
+void nexCmdf(const char *fmt, ...) {               // printf-style command
+  char buf[64];
+  va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+  nexCmd(buf);
+}
+
+void sendTxt(const char *obj, const char *v) { nexCmdf("%s.txt=\"%s\"", obj, v); }
+
+// Dash fields: only send when the command changed, and only while page 0 is shown
+void dashSend(Cache &c, const char *cmd) {
+  if (strcmp(c.cmd, cmd) == 0) return;
+  strlcpy(c.cmd, cmd, sizeof(c.cmd));
+  if (curPage == 0) nexCmd(cmd);
+}
+void setTxt(Cache &c, const char *obj, const char *v) {
+  char b[40]; snprintf(b, sizeof(b), "%s.txt=\"%s\"", obj, v); dashSend(c, b);
+}
+void setNum(Cache &c, const char *obj, const char *attr, int v) {
+  char b[40]; snprintf(b, sizeof(b), "%s.%s=%d", obj, attr, v); dashSend(c, b);
+}
+
+// =====================================================================
+//  Units
+// =====================================================================
+const char *degUnit() { return S.tempF ? DEG "F" : DEG "C"; }
+float toTemp(float c) { return S.tempF ? c * 9.0f / 5.0f + 32.0f : c; }
+
+void updateUnits() {
+  setTxt(cUOil, "tUOil", S.psi ? "psi" : "bar");
+  setTxt(cUWat, "tUWat", degUnit());
+  setTxt(cUAir, "tUAir", degUnit());
+  setTxt(cUSpd, "tUSpd", S.mph ? "mph" : "km/h");
+}
+
+// =====================================================================
+//  Dash elements
+// =====================================================================
+void showRpmNumber(int rpm) {
+  int red = S.shiftOn - 400, amber = S.shiftOn - 2000;
+  char v[8]; snprintf(v, sizeof(v), "%d", rpm);
+  setTxt(cRpm, "tRpm", v);
+  setNum(cRpmCol, "tRpm", "pco", rpm >= red ? C_RED : rpm >= amber ? C_AMBER : C_WHITE);
+}
+
+void showBar(int val) { setNum(cBar, "j0", "val", constrain(val, 0, 100)); }
+
+void startShift(bool on) {
+  shiftOn = on;
+  if (curPage != 0) return;                     // resyncDash() restores it later
+  if (on) { nexCmd("j0.val=100"); nexCmd("tmShift.en=1"); }
+  else    { nexCmd("tmShift.en=0"); nexCmdf("j0.ppic=%d", PIC_RPM_ON); }
+}
+
+void showRpm(int rpm) {
+  curRpm = rpm;
+  if (trackPeaks) PK.rpm = max(PK.rpm, (float)rpm);
+  showRpmNumber(rpm);
+  if (!shiftOn && rpm >= S.shiftOn) { strlcpy(cBar.cmd, "j0.val=100", sizeof(cBar.cmd)); startShift(true); }
+  else if (shiftOn && rpm < S.shiftOff) startShift(false);
+  if (shiftOn) return;
+  float span = max(S.barFull - S.barStart, 500.0f);
+  int seg = constrain((int)lround((rpm - S.barStart) / span * 40), 0, 40);
+  showBar(seg * 5 / 2);                         // whole segments only
+}
+
+void showGear(char g) {                         // 'R', 'N', '1'..'6'
+  int pic = g == 'R' ? PIC_GEAR_R : g == 'N' ? PIC_GEAR_N : PIC_GEAR_N + (g - '0');
+  setNum(cGear, "pGear", "pic", pic);
+}
+
+void showSpeed(float kmh) {
+  lastKmh = kmh;
+  if (trackPeaks) PK.kmh = max(PK.kmh, kmh);
+  char v[8]; snprintf(v, sizeof(v), "%d", (int)(S.mph ? kmh * 0.621371f : kmh));
+  setTxt(cSpd, "tSpd", v);
+}
+
+void showTile(int i, float v, bool warn) {      // v is metric
+  const Tile &T = TILES[i];
+  lastTile[i] = v; lastWarn[i] = warn; tileValid[i] = true;
+  if (trackPeaks && i == WAT) PK.water = max(PK.water, v);
+  if (trackPeaks && i == OIL && curRpm > S.oilCheckRpm) PK.oil = min(PK.oil, v);
+  char txt[12];
+  if (i == OIL && S.psi)          snprintf(txt, sizeof(txt), "%ld", lround(v * 14.5038f));
+  else if (i == WAT || i == AIR)  snprintf(txt, sizeof(txt), "%ld", lround(toTemp(v)));
+  else                            snprintf(txt, sizeof(txt), "%.*f", T.dec, v);
+  setTxt(cVal[i], T.t, txt);
+  setNum(cPos[i], T.h, "val", constrain((int)lround((v - T.lo) / (T.hi - T.lo) * 100), 0, 100));
+  setNum(cCol[i], T.t, "pco", warn ? C_RED : C_WHITE);
+}
+
+void tileDashes(int i, uint16_t color) {        // no value: "--", marker at 0
+  tileValid[i] = false;
+  setTxt(cVal[i], TILES[i].t, "--");
+  setNum(cPos[i], TILES[i].h, "val", 0);
+  setNum(cCol[i], TILES[i].t, "pco", color);
+}
+
+void showNoData() {                             // link lost: never show frozen values
+  if (shiftOn) startShift(false);
+  showBar(0);
+  setTxt(cRpm, "tRpm", "----");
+  setNum(cRpmCol, "tRpm", "pco", C_WHITE);
+  setTxt(cSpd, "tSpd", "--");
+  lastKmh = -1;
+  showGear('N');
+  for (int i = 0; i < 6; i++) tileDashes(i, C_AMBER);
+}
+
+void resyncDash() {                             // dash page reloaded: send everything again
+  nexCmdf("tmShift.tim=%d", (int)S.flashMs);
+  Cache *all[] = {&cRpm, &cRpmCol, &cBar, &cGear, &cSpd, &cUOil, &cUWat, &cUAir, &cUSpd};
+  for (Cache *c : all) if (c->cmd[0]) nexCmd(c->cmd);
+  for (int i = 0; i < 6; i++) {
+    if (cVal[i].cmd[0]) nexCmd(cVal[i].cmd);
+    if (cPos[i].cmd[0]) nexCmd(cPos[i].cmd);
+    if (cCol[i].cmd[0]) nexCmd(cCol[i].cmd);
+  }
+  if (shiftOn) startShift(true);
+}
+
+// =====================================================================
+//  Settings pages
+// =====================================================================
+void loadSettings() {
+  prefs.begin("dash", false);
+  if (prefs.getBytesLength("s") == sizeof(Settings)) prefs.getBytes("s", &S, sizeof(Settings));
+}
+void saveSettings() {
+  if (!settingsDirty) return;
+  prefs.putBytes("s", &S, sizeof(Settings));
+  settingsDirty = false;
+  Serial.println("settings saved");
+}
+
+void fmtParam(const Param &p, char *out, size_t n) {
+  float v = *p.v;
+  switch (p.kind) {
+    case K_TEMP: snprintf(out, n, "%ld%s", lround(toTemp(v)), degUnit()); break;
+    case K_BAR:  if (S.psi) snprintf(out, n, "%ld psi", lround(v * 14.5038f)); else snprintf(out, n, "%.1f bar", v); break;
+    case K_VOLT: snprintf(out, n, "%.1f V", v); break;
+    case K_PCT:  snprintf(out, n, "%d %%", (int)v); break;
+    case K_AFR:  snprintf(out, n, "%.1f", v); break;
+    default:     snprintf(out, n, "%d", (int)v); break;      // rpm, ms
   }
 }
 
-// sends 'A', waits for the reply, returns true if we got at least the
-// bytes we need. Returns false (and leaves gauges alone) on any
-// timeout/short read - never parses a partial/garbage buffer.
-bool requestSpeeduinoData() {
-  if (!SerialSpeeduino.connected(0)) return false;
-
-  flushSpeeduinoRx();
-  SerialSpeeduino.write('A');
-
-  uint32_t start = millis();
-  int received = 0;
-  while (millis() - start < SPEEDUINO_RESPONSE_TIMEOUT_MS && received < SPEEDUINO_RESPONSE_MIN_BYTES) {
-    if (SerialSpeeduino.available()) {
-      speeduinoBuf[received++] = SerialSpeeduino.read();
-    }
+void fmtPeak(int k, char *out, size_t n) {
+  strlcpy(out, "--", n);                        // default when there is no peak yet
+  switch (k) {
+    case 0: if (PK.rpm > 0) snprintf(out, n, "%d", (int)PK.rpm); break;
+    case 1: if (PK.kmh > 0) snprintf(out, n, "%d %s", (int)(S.mph ? PK.kmh * 0.621371f : PK.kmh), S.mph ? "mph" : "km/h"); break;
+    case 2: if (PK.water > 0) snprintf(out, n, "%ld%s", lround(toTemp(PK.water)), degUnit()); break;
+    case 3: if (PK.oil < 99) {
+              if (S.psi) snprintf(out, n, "%ld psi", lround(PK.oil * 14.5038f));
+              else       snprintf(out, n, "%.1f bar", PK.oil);
+            }
+            break;
   }
-  return received >= SPEEDUINO_RESPONSE_MIN_BYTES;
 }
 
-// Cheap extra safety net on top of the length check above: even a
-// full-length read can still be misaligned garbage. RPM > 12000 is not a
-// real reading on anything this dash would be bolted to, so treat it as a
-// bad frame and skip the cycle rather than let a bogus number trigger the
-// flashing-redline warning or a nonsense gauge jump.
-const long RPM_SANITY_MAX = 12000;
-
-// ---------------------------------------------------------------------
-// Fuel sender - NOT from Speeduino. A bare resistive sender (300 ohm
-// empty, 35 ohm full, per your measurement) wired as a voltage divider:
-//   3.3V --[150 ohm fixed resistor]--+--[sender, 300-35 ohm]-- GND
-//                                     |
-//                                  GPIO34 (ADC1, safe from Bluetooth's
-//                                  ADC2 conflicts, input-only pin)
-// Add a 1uF cap from GPIO34 to GND at the board for basic noise
-// filtering; the exponential smoothing below handles the much bigger
-// problem of fuel physically sloshing around while driving.
-// ---------------------------------------------------------------------
-const int FUEL_ADC_PIN = 34;
-const float FUEL_DIVIDER_FIXED_OHMS = 150.0f; // the fixed resistor in the divider - update this if you change the resistor
-const float FUEL_EMPTY_OHMS = 300.0f;
-const float FUEL_FULL_OHMS  = 35.0f;
-const uint32_t FUEL_READ_INTERVAL_MS = 200; // how often to take a raw ADC sample
-const float FUEL_SMOOTHING_ALPHA = 0.02f;   // heavy smoothing - fuel sloshes a lot
-
-// This assumes resistance-vs-fuel-level is roughly LINEAR between your two
-// measured points (300 ohm empty, 35 ohm full). Real senders aren't always
-// perfectly linear across the whole tank - if the gauge reads noticeably
-// off around half-full, measure the resistance at a known half-tank fill
-// and we can switch this to a proper multi-point lookup table instead.
-float fuelFilteredPct = -1.0f; // -1 = not yet initialized
-uint32_t lastFuelRead = 0;
-
-float readFuelPercentRaw() {
-  int adc = analogRead(FUEL_ADC_PIN); // 0-4095 (12-bit)
-  float voltage = (adc / 4095.0f) * 3.3f;
-  if (voltage < 0.01f) voltage = 0.01f;   // avoid divide-by-zero / negative resistance
-  if (voltage > 3.29f) voltage = 3.29f;   // avoid divide-by-zero as voltage -> 3.3V
-
-  float senderOhms = FUEL_DIVIDER_FIXED_OHMS * voltage / (3.3f - voltage);
-  float pct = (FUEL_EMPTY_OHMS - senderOhms) / (FUEL_EMPTY_OHMS - FUEL_FULL_OHMS) * 100.0f;
-  if (pct < 0)   pct = 0;
-  if (pct > 100) pct = 100;
-  return pct;
+void fillStatus() {                             // page 4 live part
+  static const char *PK_OBJ[4] = {"tPk0", "tPk1", "tPk2", "tPk3"};
+  char s[24];
+  for (int k = 0; k < 4; k++) { fmtPeak(k, s, sizeof(s)); sendTxt(PK_OBJ[k], s); }
+  bool fresh = millis() - ECU.stamp < STALE_MS;
+  if (linkState != LINK_CONNECTED) { sendTxt("tLink", "SEARCHING"); nexCmdf("tLink.pco=%u", C_AMBER); }
+  else if (!fresh)                 { sendTxt("tLink", "NO DATA");   nexCmdf("tLink.pco=%u", C_RED); }
+  else                             { sendTxt("tLink", "CONNECTED"); nexCmdf("tLink.pco=%u", C_GREEN); }
+  snprintf(s, sizeof(s), "%u Hz " "\xB7" " %lu errors", (unsigned)pktPerSec, (unsigned long)pktErrors);
+  sendTxt("tHz", s);
 }
 
-void updateFuelLevel() {
-  if (millis() - lastFuelRead < FUEL_READ_INTERVAL_MS) return;
-  lastFuelRead = millis();
+void fillPage(int pg) {
+  char v[16];
+  if (pg == 1) {
+    nexCmdf("hBri.val=%d", S.bright);
+    snprintf(v, sizeof(v), "%d", S.bright); sendTxt("tBri", v);
+    nexCmdf("pTemp.pic=%d", S.tempF ? PIC_TOG_F : PIC_TOG_C);
+    nexCmdf("pPres.pic=%d", S.psi ? PIC_TOG_PSI : PIC_TOG_BAR);
+    nexCmdf("pSpd.pic=%d", S.mph ? PIC_TOG_MPH : PIC_TOG_KMH);
+  }
+  for (int i = 0; i < N_PARAMS; i++)
+    if (PARAMS[i].page == pg) { fmtParam(PARAMS[i], v, sizeof(v)); sendTxt(PARAMS[i].obj, v); }
+  if (pg == 4) fillStatus();
+}
 
-  float raw = readFuelPercentRaw();
-  if (fuelFilteredPct < 0) {
-    fuelFilteredPct = raw; // first reading - snap straight to it, don't ramp up from 0
+void adjustByCode(int code) {
+  int idx = code >= 0x30 ? 5 + (code - 0x30) / 2 : (code - 0x20) / 2;
+  if (idx < 0 || idx >= N_PARAMS) return;
+  Param &p = PARAMS[idx];
+  float dir = (code & 1) ? 1 : -1;
+  *p.v = constrain(roundf((*p.v + dir * p.step) / p.step) * p.step, p.lo, p.hi);
+  // keep pairs sensible
+  if (S.shiftOff > S.shiftOn - 50) S.shiftOff = S.shiftOn - 50;
+  if (S.barStart > S.barFull - 1000) S.barStart = max(0.0f, S.barFull - 1000);
+  if (S.battHigh < S.battLow + 0.5f) { if (p.v == &S.battLow) S.battLow = S.battHigh - 0.5f; else S.battHigh = S.battLow + 0.5f; }
+  settingsDirty = true;
+  fillPage(p.page);                             // refresh the page (linked values may have moved)
+}
+
+void onPress(int code) {
+  if (code >= 0x20 && code <= 0x3F) {           // - / + buttons
+    adjustByCode(code);
+    heldCode = code; heldSince = lastRepeat = millis();
+    return;
+  }
+  switch (code) {
+    case 0x10: S.tempF = false; break;
+    case 0x11: S.tempF = true;  break;
+    case 0x12: S.psi = false;   break;
+    case 0x13: S.psi = true;    break;
+    case 0x14: S.mph = false;   break;
+    case 0x15: S.mph = true;    break;
+    case 0x40: PK = Peaks(); Serial.println("peaks reset"); break;
+    default: return;                            // anything else (e.g. old 0x41 switch) is ignored
+  }
+  if (code <= 0x15) {                           // units changed: dash values follow
+    updateUnits();
+    bool tp = trackPeaks; trackPeaks = false;
+    for (int i = 0; i < 6; i++) if (tileValid[i]) showTile(i, lastTile[i], lastWarn[i]);
+    if (lastKmh >= 0) showSpeed(lastKmh);
+    trackPeaks = tp;
+    settingsDirty = true;
+  }
+  fillPage(curPage);
+}
+
+void handleHold() {                             // auto-repeat while - / + is held
+  if (heldCode < 0) return;
+  uint32_t now = millis(), held = now - heldSince;
+  if (held > 15000) { heldCode = -1; return; }  // safety if a release got lost
+  uint32_t every = held < 500 ? 0 : held < 2000 ? 120 : 40;
+  if (every && now - lastRepeat >= every) { adjustByCode(heldCode); lastRepeat = now; }
+}
+
+void setBrightness(int v) {
+  v = constrain(v, 10, 100);
+  if (v == S.bright) return;
+  S.bright = v;
+  settingsDirty = true;
+  nexCmdf("dim=%d", v);
+  if (curPage == 1) { char b[6]; snprintf(b, sizeof(b), "%d", v); sendTxt("tBri", b); }
+}
+
+void onPageEnter(int pg) {
+  int prev = curPage;
+  curPage = pg;
+  heldCode = -1;
+  pageFilledAt = millis();
+  Serial.printf("page %d\n", pg);
+  if (pg == 0) {
+    if (prev != 0) saveSettings();
+    resyncDash();
   } else {
-    fuelFilteredPct += (raw - fuelFilteredPct) * FUEL_SMOOTHING_ALPHA;
+    fillPage(pg);
   }
-
-  applyFuel((long)(fuelFilteredPct + 0.5f));
 }
 
+// Nextion -> ESP32: 3 bytes '#' type code   (E page / P press / R release / B brightness)
+void handleFrame(uint8_t type, uint8_t code) {
+  switch (type) {
+    case 'E': onPageEnter(code); break;
+    case 'P': onPress(code); break;
+    case 'R': if (code == heldCode) heldCode = -1; break;
+    case 'B': setBrightness(code); break;
+  }
+}
+
+// Frames we understand:
+//   '#' type code              (3 bytes, from printh in the HMI)
+//   0x66 page FF FF FF         (answer to "sendme": which page is shown)
+//   0x71 b0 b1 b2 b3 FF FF FF  (answer to "get hBri.val")
+void pollNextion() {
+  static uint8_t buf[8], n = 0, need = 0;
+  while (NEX.available()) {
+    uint8_t b = NEX.read();
+    if (dumpNex) Serial.printf("NEX %02X\n", b);
+    if (n == 0) {
+      need = b == '#' ? 3 : b == 0x66 ? 5 : b == 0x71 ? 8 : 0;
+      if (!need) continue;                      // not a frame start (e.g. 0x88 "ready") - skip
+    }
+    buf[n++] = b;
+    if (n < need) continue;
+    n = 0;
+    if (buf[0] == '#') handleFrame(buf[1], buf[2]);
+    else if (buf[0] == 0x66) { if (buf[1] != curPage) onPageEnter(buf[1]); }
+    else if (buf[0] == 0x71 && curPage == 1 && millis() - pageFilledAt > 400) setBrightness(buf[1]);
+  }
+}
+
+// Safety net that does not depend on the HMI event code
+void pollNextionState() {
+  static uint32_t lastPage = 0, lastBri = 0;
+  uint32_t now = millis();
+  if (now - lastPage > PAGE_POLL_MS) { lastPage = now; nexCmd("sendme"); }
+  if (curPage == 1 && now - lastBri > BRI_POLL_MS && now - pageFilledAt > 400) { lastBri = now; nexCmd("get hBri.val"); }
+}
+
+// =====================================================================
+//  Speeduino over Bluetooth  (runs as its own task on core 0)
+// =====================================================================
+uint16_t u16(const uint8_t *d, int o) { return d[o] | (d[o + 1] << 8); }
+
+// Wait until nothing has arrived for FLUSH_QUIET_MS - late bytes from the previous
+// reply must not end up at the start of the next one (that misaligns every offset).
+void flushQuiet() {
+  uint32_t quiet = millis();
+  while (millis() - quiet < (uint32_t)FLUSH_QUIET_MS) {
+    if (SerialBT.available()) { SerialBT.read(); quiet = millis(); }
+    else vTaskDelay(1);
+  }
+}
+
+// Send 'A', read the first RESP_MIN bytes of the reply. False on timeout / short read.
+bool requestPacket(uint8_t *out) {
+  flushQuiet();
+  SerialBT.write('A');
+  uint32_t t0 = millis();
+  int n = 0;
+  while (millis() - t0 < (uint32_t)RESP_TIMEOUT_MS && n < RESP_MIN) {
+    if (SerialBT.available()) out[n++] = SerialBT.read();
+    else vTaskDelay(1);
+  }
+  if (dumpRaw) {
+    Serial.printf("RX %d bytes:", n);
+    for (int i = 0; i < n; i++) Serial.printf("%s%02X", i % 16 ? " " : "\n  ", out[i]);
+    Serial.println();
+  }
+  return n >= RESP_MIN;
+}
+
+bool decode(const uint8_t *d, EcuData &e) {
+  e.rpm  = u16(d, OFS_RPM);
+  e.clt  = (int)d[OFS_CLT] - 40;
+  e.iat  = (int)d[OFS_IAT] - 40;
+  e.batt = d[OFS_BATT] / 10.0f;
+  e.afr  = d[OFS_AFR] / 10.0f;
+  e.kmh  = OFS_VSS >= 0 ? u16(d, OFS_VSS) : 0;
+  e.gear = OFS_GEAR >= 0 ? d[OFS_GEAR] : 0;
+  e.oilBar = OFS_OIL >= 0 ? (OIL_RAW_IS_PSI ? d[OFS_OIL] / 14.5038f : d[OFS_OIL] / 100.0f) : 0;
+  // sanity check - garbage from a bad packet must not reach the screen
+  return e.rpm < 20000 && e.clt > -40 && e.clt < 200 && e.batt < 25 && e.kmh < 400;
+}
+
+void ecuTask(void *) {
+  SerialBT.begin(ESP_BT_NAME, true);                       // true = ESP32 is the master
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  SerialBT.setPin(ECU_BT_PIN, strlen(ECU_BT_PIN));
+#else
+  SerialBT.setPin(ECU_BT_PIN);
+#endif
+  static uint8_t data[160];
+  uint32_t secStart = millis();
+  uint16_t count = 0;
+
+  for (;;) {
+    if (!SerialBT.connected(0)) {
+      linkState = LINK_SEARCHING;
+      Serial.println("BT: connecting...");
+      bool ok = BT_USE_ADDRESS ? SerialBT.connect(ECU_BT_ADDR) : SerialBT.connect(ECU_BT_NAME);
+      if (!ok) { Serial.println("BT: not found, retry in 2 s"); vTaskDelay(pdMS_TO_TICKS(2000)); continue; }
+      Serial.println("BT: connected");
+      linkState = LINK_CONNECTED;
+    }
+    uint32_t t = millis();
+    EcuData e;
+    if (requestPacket(data) && decode(data, e)) {
+      e.stamp = millis();
+      portENTER_CRITICAL(&ecuMux); ECU = e; portEXIT_CRITICAL(&ecuMux);
+      count++;
+    } else {
+      pktErrors++;
+    }
+    if (millis() - secStart >= 1000) { pktPerSec = count; count = 0; secStart = millis(); }
+    int32_t wait = POLL_MS - (int32_t)(millis() - t);
+    vTaskDelay(pdMS_TO_TICKS(wait > 1 ? wait : 1));
+  }
+}
+
+// =====================================================================
+//  Dash update from live data
+// =====================================================================
+char gearFor(const EcuData &e) {
+  if (e.gear > 0 && e.gear <= 6) return '0' + e.gear;
+  if (!CALC_GEAR || e.kmh < 3 || e.rpm < 500) return 'N';
+  float wheelRpm = e.kmh * 1000.0f / 60.0f / TYRE_CIRC_M;
+  float ratio = e.rpm / wheelRpm / FINAL_DRIVE;
+  int best = 0; float bestErr = 0.15f;                     // must be within 15 % of a gear
+  for (int g = 1; g <= 6; g++) {
+    float err = fabsf(ratio - RATIO[g]) / RATIO[g];
+    if (err < bestErr) { bestErr = err; best = g; }
+  }
+  return best ? '0' + best : 'N';                          // clutch in / coasting -> N
+}
+
+float readFuelPct() {                          // called every TILE_MS
+  static float f = -1;
+  if (FUEL_PIN < 0) return -1;
+  float v = analogRead(FUEL_PIN) / 4095.0f * 3.3f;
+  v = constrain(v, 0.01f, 3.29f);
+  float ohms = FUEL_DIVIDER_FIXED_OHMS * v / (3.3f - v);
+  float pct = constrain((FUEL_EMPTY_OHMS - ohms) / (FUEL_EMPTY_OHMS - FUEL_FULL_OHMS) * 100.0f, 0.0f, 100.0f);
+  f = f < 0 ? pct : f + (pct - f) * 0.02f;               // heavy smoothing, fuel sloshes
+  return f;
+}
+
+void updateDash() {
+  static uint32_t lastStamp = 0, lastSlow = 0;
+  uint32_t now = millis();
+
+  EcuData e;
+  portENTER_CRITICAL(&ecuMux); e = ECU; portEXIT_CRITICAL(&ecuMux);
+  bool fresh = e.stamp && now - e.stamp < STALE_MS;
+  if (!fresh) {
+    trackPeaks = false;
+    if (!showingNoData) { showNoData(); showingNoData = true; }
+    return;
+  }
+  trackPeaks = true;
+
+  // RPM / bar / shift light / gear / speed: only when a NEW packet arrived
+  if (e.stamp != lastStamp || showingNoData) {
+    lastStamp = e.stamp;
+    showingNoData = false;
+    showRpm((int)e.rpm / 10 * 10);
+    showGear(gearFor(e));
+    if (OFS_VSS >= 0) showSpeed(e.kmh);
+    else { lastKmh = -1; setTxt(cSpd, "tSpd", "--"); }
+  }
+
+  // tiles: slower
+  if (now - lastSlow >= TILE_MS) {
+    lastSlow = now;
+    if (OFS_OIL >= 0) showTile(OIL, e.oilBar, e.oilBar < S.oilLow && e.rpm > S.oilCheckRpm); else tileDashes(OIL, C_WHITE);
+    showTile(WAT, e.clt, e.clt > S.waterHot);
+    showTile(BAT, e.batt, e.batt < S.battLow || e.batt > S.battHigh);
+    showTile(AFR, e.afr, e.rpm > 2500 && e.afr > S.afrLean);   // lean on idle/overrun is normal
+    float fuel = readFuelPct();
+    if (fuel >= 0) showTile(FUE, fuel, fuel < S.fuelLow); else tileDashes(FUE, C_WHITE);
+    showTile(AIR, e.iat, e.iat > S.airHot);
+  }
+}
+
+// =====================================================================
 void setup() {
-  analogSetPinAttenuation(FUEL_ADC_PIN, ADC_11db); // full 0-3.3V range on the fuel ADC pin
+  Serial.begin(115200);
+  loadSettings();
+  if (FUEL_PIN >= 0) analogSetPinAttenuation(FUEL_PIN, ADC_11db);
 
-  NextionSerial.begin(nextionBaud, SERIAL_8N1, NEXTION_RX_PIN, NEXTION_TX_PIN);
-  delay(300);
+  // Big TX buffer: Nextion writes go to RAM and the UART sends them in the
+  // background, so the loop never waits for the 115200-baud line.
+  NEX.setTxBufferSize(2048);
+  NEX.setRxBufferSize(512);
+  NEX.begin(NEX_BAUD, SERIAL_8N1, NEX_RX, NEX_TX);
+  delay(800);                                              // let the Nextion boot
+  static const uint8_t FLUSH[3] = {0xFF, 0xFF, 0xFF};
+  NEX.write(FLUSH, 3);                                     // flush any junk
+  nexCmd("bkcmd=0");
+  nexCmdf("dim=%d", S.bright);
+  updateUnits();
+  showNoData(); showingNoData = true;
+  nexCmd("page 0");                                        // Nextion answers '#E0' -> resync
 
-  NextionSerial.print("page 0");
-  nextionEnd();
-
-  // startup state - so the dashboard looks correct even before the first
-  // Speeduino reply arrives
-  applyRpm(0);
-  applyCoolant(0);
-  applyAfr(AFR_MIN_X10);
-  applyTps(0);
-  applyIat(0);
-  applyBattery(BATTERY_MIN_X10);
-  applySpeed(0);
-  applyGear(0);
-  applyIgnition(0);
-  updateFuelLevel(); // first real fuel reading, snapped straight in (no ramp-up)
-
-  SerialSpeeduino.begin("ESP32_Dash", true); // name only matters for BT discovery logs; true = master
+  xTaskCreatePinnedToCore(ecuTask, "ecu", 8192, nullptr, 2, nullptr, 0);
+  Serial.println("\nAX Race Dash live. Keys: d = Speeduino dump, n = Nextion dump, s = decoded values");
 }
 
 void loop() {
-  updateFuelLevel(); // independent of Speeduino/Bluetooth - runs regardless of BT state
+  pollNextion();
+  pollNextionState();
+  handleHold();
+  if (curPage == 0) updateDash();
+  if (curPage == 4 && millis() - lastStatus > 1000) { lastStatus = millis(); fillStatus(); }
 
-  connectSpeeduinoIfNeeded();
-
-  if (millis() - lastPollTime >= SPEEDUINO_POLL_INTERVAL_MS) {
-    lastPollTime = millis();
-
-    if (requestSpeeduinoData()) {
-      long rpm        = speeduinoBuf[14] | ((long)speeduinoBuf[15] << 8);
-      long coolantC   = (long)speeduinoBuf[7] - 40;
-      long iatC       = (long)speeduinoBuf[6] - 40;
-      long batteryX10 = speeduinoBuf[9];
-      long afrX10     = speeduinoBuf[10];
-      long tpsPct     = speeduinoBuf[25] / 2;
-      long vss        = speeduinoBuf[104] | ((long)speeduinoBuf[105] << 8);
-      long gear       = speeduinoBuf[106];
-      long ignitionDeg = (int8_t)speeduinoBuf[24]; // signed byte, real degrees BTDC directly
-
-      if (rpm > RPM_SANITY_MAX) {
-        // almost certainly a misaligned/corrupted frame - skip this whole
-        // cycle rather than display or act on any of it
-        return;
-      }
-
-      applyRpm(rpm);
-      applyCoolant(coolantC);
-      applyAfr(afrX10);
-      applyTps(tpsPct);
-      applyIat(iatC);
-      applyBattery(batteryX10);
-      applySpeed(vss);
-      applyGear(gear);
-      applyIgnition(ignitionDeg);
+  while (Serial.available()) {
+    char k = Serial.read();
+    if (k == 'n') { dumpNex = !dumpNex; Serial.printf("Nextion RX dump %s\n", dumpNex ? "ON" : "OFF"); }
+    if (k == 'd') { dumpRaw = !dumpRaw; Serial.printf("raw dump %s\n", dumpRaw ? "ON" : "OFF"); }
+    if (k == 's') {
+      EcuData e; portENTER_CRITICAL(&ecuMux); e = ECU; portEXIT_CRITICAL(&ecuMux);
+      Serial.printf("rpm %.0f  clt %.0f  iat %.0f  batt %.1f  afr %.1f  oil %.2f bar  vss %.0f  gear %d  | %u Hz, %lu errors\n",
+                    e.rpm, e.clt, e.iat, e.batt, e.afr, e.oilBar, e.kmh, e.gear, (unsigned)pktPerSec, (unsigned long)pktErrors);
     }
-    // if requestSpeeduinoData() returned false (not connected, or a
-    // timeout/short read), we simply skip this cycle - gauges keep
-    // showing their last good values instead of jumping to garbage.
   }
+  delay(1);
 }
